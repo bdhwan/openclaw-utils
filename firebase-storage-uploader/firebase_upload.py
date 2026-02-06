@@ -144,7 +144,16 @@ def upload_to_firebase(env_path: str, source_path: str, dest_path: str, make_pub
     print(f"Uploading {source_path} ({file_size / 1024 / 1024:.2f} MB) to {dest_path}...")
     print(f"Content-Type: {content_type}")
     
+    # Set metadata for proper download filename with UTF-8 encoding
+    from urllib.parse import quote
+    filename = Path(source_path).name
+    encoded_filename = quote(filename, safe='')
+    blob.content_disposition = f"inline; filename*=UTF-8''{encoded_filename}"
+    
     blob.upload_from_filename(source_path, content_type=content_type)
+    
+    # Update metadata
+    blob.patch()
     print("Upload complete!")
     
     # Get URL
