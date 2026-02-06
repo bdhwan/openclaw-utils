@@ -15,14 +15,49 @@ Required .env variables:
 """
 
 import argparse
+import mimetypes
 import os
 import sys
 from pathlib import Path
 
+# Content type mappings with UTF-8 charset for text files
+CONTENT_TYPES = {
+    '.md': 'text/markdown; charset=utf-8',
+    '.txt': 'text/plain; charset=utf-8',
+    '.html': 'text/html; charset=utf-8',
+    '.htm': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.xml': 'application/xml; charset=utf-8',
+    '.csv': 'text/csv; charset=utf-8',
+    '.yaml': 'text/yaml; charset=utf-8',
+    '.yml': 'text/yaml; charset=utf-8',
+}
+
+def get_content_type(filename: str) -> str:
+    """Get content type for a file, with UTF-8 charset for text files."""
+    ext = Path(filename).suffix.lower()
+    
+    # Check our custom mappings first (with charset)
+    if ext in CONTENT_TYPES:
+        return CONTENT_TYPES[ext]
+    
+    # Fall back to mimetypes
+    content_type, _ = mimetypes.guess_type(filename)
+    if content_type:
+        # Add charset for text types
+        if content_type.startswith('text/'):
+            return f"{content_type}; charset=utf-8"
+        return content_type
+    
+    # Default
+    return 'application/octet-stream'
+
 def load_env(env_path: str) -> dict:
     """Load environment variables from .env file."""
     env_vars = {}
-    with open(env_path, 'r') as f:
+    with open(env_path, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
@@ -50,7 +85,7 @@ def get_firebase_cred(env_vars: dict) -> dict:
         "universe_domain": env_vars.get('FB_UNIVERSE_DOMAIN', 'googleapis.com')
     }
 
-def upload_to_firebase(env_path: str, source_path: str, dest_path: str, make_public: bool = True) -> str:
+def upload_to_firebase(env_path: str, source_path: str, dest_path: str, make_public: bool = True, content_type: str = None) -> str:
     """
     Upload a file to Firebase Storage.
     
@@ -59,6 +94,7 @@ def upload_to_firebase(env_path: str, source_path: str, dest_path: str, make_pub
         source_path: Local file path to upload
         dest_path: Destination path in Firebase Storage (e.g., 'folder/file.zip')
         make_public: Whether to make the file publicly accessible
+        content_type: Override content type (auto-detected if not specified)
         
     Returns:
         Public URL or signed URL of the uploaded file
@@ -96,14 +132,19 @@ def upload_to_firebase(env_path: str, source_path: str, dest_path: str, make_pub
             'storageBucket': env_vars['FB_STORAGE_BUCKET']
         })
     
+    # Determine content type
+    if content_type is None:
+        content_type = get_content_type(source_path)
+    
     # Upload file
     bucket = storage.bucket()
     blob = bucket.blob(dest_path)
     
     file_size = os.path.getsize(source_path)
     print(f"Uploading {source_path} ({file_size / 1024 / 1024:.2f} MB) to {dest_path}...")
+    print(f"Content-Type: {content_type}")
     
-    blob.upload_from_filename(source_path)
+    blob.upload_from_filename(source_path, content_type=content_type)
     print("Upload complete!")
     
     # Get URL
@@ -130,6 +171,9 @@ Examples:
     # Upload with signed URL (not public)
     python firebase_upload.py --env .env --source file.zip --dest uploads/file.zip --no-public
     
+    # Upload with custom content type
+    python firebase_upload.py --env .env --source data.bin --dest uploads/data.bin --content-type application/octet-stream
+    
 Required .env variables:
     FB_PROJECT_ID       - Firebase project ID
     FB_PRIVATE_KEY      - Service account private key
@@ -151,6 +195,7 @@ Optional .env variables:
     parser.add_argument('--source', '-s', required=True, help='Local file to upload')
     parser.add_argument('--dest', '-d', required=True, help='Destination path in Firebase Storage')
     parser.add_argument('--no-public', action='store_true', help='Generate signed URL instead of public URL')
+    parser.add_argument('--content-type', '-c', help='Override content type (auto-detected by default)')
     
     args = parser.parse_args()
     
@@ -158,7 +203,8 @@ Optional .env variables:
         env_path=args.env,
         source_path=args.source,
         dest_path=args.dest,
-        make_public=not args.no_public
+        make_public=not args.no_public,
+        content_type=args.content_type
     )
 
 if __name__ == '__main__':
