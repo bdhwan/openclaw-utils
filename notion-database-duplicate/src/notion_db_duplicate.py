@@ -654,11 +654,40 @@ def upload_dump_to_destination(
             continue
         source_databases[source_database_id] = source_db
 
+    # Check for existing databases under the parent page
+    print("Checking for existing databases...")
+    existing_dbs_by_title: Dict[str, str] = {}  # title -> database_id
+    for block in destination_client.get_block_children(destination_parent_page_id):
+        if block.get("type") == "child_database":
+            db_id = block["id"]
+            try:
+                db_data = destination_client.get_database(db_id)
+                title = get_database_title_plain(db_data)
+                if title:
+                    existing_dbs_by_title[title] = db_id
+            except NotionAPIError:
+                pass
+    print(f"  Found {len(existing_dbs_by_title)} existing databases")
+
     print("Creating destination databases from dump...")
+    skipped_count = 0
+    created_count = 0
     for source_database_id in source_database_ids:
         source_db = source_databases.get(source_database_id)
         if not source_db:
             continue
+        
+        # Get source database title
+        source_title = get_database_title_plain(source_db)
+        
+        # Check if database with same title already exists
+        if source_title and source_title in existing_dbs_by_title:
+            destination_db_id = existing_dbs_by_title[source_title]
+            source_to_destination_db_map[source_database_id] = destination_db_id
+            print(f"  ⏭️  {source_title} (already exists: {destination_db_id})")
+            skipped_count += 1
+            continue
+        
         immediate_properties, _, property_warnings = build_database_properties(
             source_properties=source_db.get("properties", {}),
             source_to_dest_db_map=source_to_destination_db_map,
@@ -673,7 +702,14 @@ def upload_dump_to_destination(
         )
         destination_db_id = destination_db.get("id")
         source_to_destination_db_map[source_database_id] = destination_db_id
-        print(f"  {source_database_id} -> {destination_db_id}")
+        print(f"  ✅ {source_title or source_database_id} -> {destination_db_id}")
+        created_count += 1
+        
+        # Add to existing map for subsequent checks
+        if source_title:
+            existing_dbs_by_title[source_title] = destination_db_id
+    
+    print(f"  Created: {created_count}, Skipped (already exists): {skipped_count}")
 
     # Save database mappings to id_mapping
     id_mapping["database_mappings"] = [
