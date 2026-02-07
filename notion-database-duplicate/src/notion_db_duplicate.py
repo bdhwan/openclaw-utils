@@ -516,6 +516,28 @@ def extract_relation_properties(source_db: Dict[str, Any]) -> List[Dict[str, Any
     return relations
 
 
+def extract_rollup_properties(source_db: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract rollup property info from a database schema for id_mapping."""
+    rollups = []
+    source_db_id = source_db.get("id", "")
+    properties = source_db.get("properties", {})
+    
+    for prop_name, prop_val in properties.items():
+        if prop_val.get("type") != "rollup":
+            continue
+        rollup_info = prop_val.get("rollup", {})
+        
+        rollups.append({
+            "source_db_id": source_db_id,
+            "property_name": prop_name,
+            "relation_property_name": rollup_info.get("relation_property_name", ""),
+            "rollup_property_name": rollup_info.get("rollup_property_name", ""),
+            "function": rollup_info.get("function", ""),
+        })
+    
+    return rollups
+
+
 def dump_databases_to_files(
     source_client: NotionClient,
     source_database_ids: List[str],
@@ -539,6 +561,7 @@ def dump_databases_to_files(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "database_mappings": [],  # Will be filled during upload
         "relation_properties": [],  # Filled during dump
+        "rollup_properties": [],  # Filled during dump
     }
 
     print(f"Writing dump to: {dump_dir}")
@@ -546,9 +569,12 @@ def dump_databases_to_files(
         print(f"  Dumping database schema: {source_database_id}")
         source_db = source_client.get_database(source_database_id)
         
-        # Extract relation properties for id_mapping
+        # Extract relation and rollup properties for id_mapping
         relations = extract_relation_properties(source_db)
         id_mapping["relation_properties"].extend(relations)
+        
+        rollups = extract_rollup_properties(source_db)
+        id_mapping["rollup_properties"].extend(rollups)
 
         pages: List[Dict[str, Any]] = []
         if include_data:
@@ -588,6 +614,7 @@ def dump_databases_to_files(
     print(f"Dump manifest written: {manifest_path}")
     print(f"ID mapping written: {id_mapping_path}")
     print(f"  Relation properties captured: {len(id_mapping['relation_properties'])}")
+    print(f"  Rollup properties captured: {len(id_mapping['rollup_properties'])}")
 
 
 def load_dump(dump_dir: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -725,7 +752,8 @@ def upload_dump_to_destination(
     newly_created_ids = [db_id for db_id in source_database_ids if db_id not in skipped_db_ids]
     
     if newly_created_ids:
-        print(f"Applying deferred complex schema properties to {len(newly_created_ids)} new databases...")
+        # Phase 1: Apply relations and formulas first
+        print(f"Phase 1: Applying relations & formulas to {len(newly_created_ids)} new databases...")
         for source_database_id in newly_created_ids:
             source_db = source_databases.get(source_database_id)
             destination_db_id = source_to_destination_db_map.get(source_database_id)
@@ -739,9 +767,17 @@ def upload_dump_to_destination(
             if not deferred_properties:
                 continue
             
-            # Apply each property individually to avoid one failure blocking others
+            # Filter: relations and formulas only (not rollups)
+            relation_formula_props = {
+                k: v for k, v in deferred_properties.items()
+                if "relation" in v or "formula" in v
+            }
+            
+            if not relation_formula_props:
+                continue
+            
             success_count = 0
-            for prop_name, prop_value in deferred_properties.items():
+            for prop_name, prop_value in relation_formula_props.items():
                 try:
                     destination_client.update_database(destination_db_id, {prop_name: prop_value})
                     success_count += 1
@@ -749,7 +785,42 @@ def upload_dump_to_destination(
                     warnings.append(f"{source_database_id}: Failed to apply '{prop_name}': {error}")
             
             if success_count > 0:
-                print(f"  Updated {success_count}/{len(deferred_properties)} complex properties for {destination_db_id}")
+                print(f"  ✅ {success_count}/{len(relation_formula_props)} relations/formulas for {destination_db_id}")
+        
+        # Phase 2: Apply rollups after relations exist
+        print(f"Phase 2: Applying rollups to {len(newly_created_ids)} new databases...")
+        for source_database_id in newly_created_ids:
+            source_db = source_databases.get(source_database_id)
+            destination_db_id = source_to_destination_db_map.get(source_database_id)
+            if not source_db or not destination_db_id:
+                continue
+            _, deferred_properties, _ = build_database_properties(
+                source_properties=source_db.get("properties", {}),
+                source_to_dest_db_map=source_to_destination_db_map,
+                defer_complex=True,
+            )
+            if not deferred_properties:
+                continue
+            
+            # Filter: rollups only
+            rollup_props = {
+                k: v for k, v in deferred_properties.items()
+                if "rollup" in v
+            }
+            
+            if not rollup_props:
+                continue
+            
+            success_count = 0
+            for prop_name, prop_value in rollup_props.items():
+                try:
+                    destination_client.update_database(destination_db_id, {prop_name: prop_value})
+                    success_count += 1
+                except NotionAPIError as error:
+                    warnings.append(f"{source_database_id}: Failed to apply rollup '{prop_name}': {error}")
+            
+            if success_count > 0:
+                print(f"  ✅ {success_count}/{len(rollup_props)} rollups for {destination_db_id}")
     else:
         print("No new databases to apply deferred properties to.")
 
