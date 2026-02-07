@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
 Dump and upload Notion databases between integrations.
+
+Features:
+- Dump: Export database schemas and data to local JSON files
+- Upload: Import dump files to another workspace
+- Repair: Fix duplicate relation properties after upload
+- Run: Dump + Upload in one command
 """
 
 from __future__ import annotations
@@ -130,6 +136,20 @@ class NotionClient:
                 break
             cursor = response.get("next_cursor")
 
+    def get_block_children(self, block_id: str) -> Iterable[Dict[str, Any]]:
+        """Get all children blocks of a page/block."""
+        cursor: Optional[str] = None
+        while True:
+            params: Dict[str, Any] = {"page_size": 100}
+            if cursor:
+                params["start_cursor"] = cursor
+            response = self.request("GET", f"/blocks/{block_id}/children", params=params)
+            for result in response.get("results", []):
+                yield result
+            if not response.get("has_more"):
+                break
+            cursor = response.get("next_cursor")
+
     def create_page(
         self,
         database_id: str,
@@ -221,9 +241,18 @@ def sanitize_database_title(source_db: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rich_text_from_plain_text(f"Duplicated {fallback}")
 
 
-def sanitize_select_options(options: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+def get_database_title_plain(db: Dict[str, Any]) -> str:
+    """Extract plain text title from database object."""
+    title_arr = db.get("title", [])
+    if title_arr and len(title_arr) > 0:
+        return title_arr[0].get("plain_text", "")
+    return ""
+
+
+def sanitize_select_options(options: List[Dict[str, Any]], max_options: int = 100) -> List[Dict[str, str]]:
+    """Sanitize select options, limiting to max_options to avoid Notion API limit."""
     sanitized: List[Dict[str, str]] = []
-    for option in options:
+    for option in options[:max_options]:  # Limit to max_options
         name = option.get("name")
         if not name:
             continue
@@ -270,8 +299,11 @@ def property_schema_config(
         destination_relation_db_id = source_to_dest_db_map.get(source_relation_db_id, source_relation_db_id)
         relation_type = relation.get("type", "single_property")
         relation_config: Dict[str, Any] = {"database_id": destination_relation_db_id}
-        if relation_type in {"single_property", "dual_property"}:
-            relation_config[relation_type] = {}
+        
+        # Use single_property to avoid auto-generated reverse relations
+        # We'll create the reverse relation explicitly with the correct name
+        relation_config["single_property"] = {}
+        
         return prop_type, relation_config, "relation"
 
     if prop_type == "rollup":
@@ -674,6 +706,99 @@ def upload_dump_to_destination(
             print(f"  - {warning}")
 
 
+def repair_duplicate_relations(
+    client: NotionClient,
+    parent_page_id: str,
+    dump_dir: Path,
+) -> None:
+    """
+    Repair duplicate relation properties created by dual_property auto-generation.
+    
+    When Notion creates dual_property relations, it auto-generates reverse relations
+    with names like "Related to X (Y)". This function removes those duplicates
+    if the original property name already exists.
+    """
+    print("Loading dump for reference...")
+    manifest, records = load_dump(dump_dir)
+    
+    # Build original property names per database title
+    original_props_by_title: Dict[str, set] = {}
+    for record in records:
+        source_db = record.get("database", {})
+        title = get_database_title_plain(source_db)
+        if title:
+            original_props_by_title[title] = set(source_db.get("properties", {}).keys())
+    
+    print(f"  Loaded {len(original_props_by_title)} database schemas from dump")
+    
+    # Get all databases under the parent page
+    print("Fetching destination databases...")
+    dest_dbs: Dict[str, Dict[str, Any]] = {}
+    
+    for block in client.get_block_children(parent_page_id):
+        if block.get("type") == "child_database":
+            db_id = block["id"]
+            db_data = client.get_database(db_id)
+            title = get_database_title_plain(db_data)
+            dest_dbs[title] = {
+                "id": db_id,
+                "properties": db_data.get("properties", {})
+            }
+    
+    print(f"  Found {len(dest_dbs)} destination databases")
+    
+    # Find and remove duplicate "Related to..." properties
+    print("\nRemoving duplicate 'Related to...' properties...")
+    total_deleted = 0
+    
+    for title, dest_info in dest_dbs.items():
+        if title not in original_props_by_title:
+            continue
+        
+        original_names = original_props_by_title[title]
+        dest_props = dest_info["properties"]
+        db_id = dest_info["id"]
+        
+        # Find "Related to..." properties that are duplicates
+        to_delete = []
+        for prop_name, prop_val in dest_props.items():
+            if not prop_name.startswith("Related to "):
+                continue
+            if prop_val.get("type") != "relation":
+                continue
+            
+            # Get target database ID
+            target_id = prop_val.get("relation", {}).get("database_id", "")
+            
+            # Check if any original property also points to this target
+            for orig_name in original_names:
+                if orig_name not in dest_props:
+                    continue
+                orig_prop = dest_props[orig_name]
+                if orig_prop.get("type") != "relation":
+                    continue
+                orig_target = orig_prop.get("relation", {}).get("database_id", "")
+                if orig_target == target_id:
+                    to_delete.append(prop_name)
+                    break
+        
+        if to_delete:
+            # Delete properties by setting them to None
+            updates = {name: None for name in to_delete}
+            try:
+                client.update_database(db_id, updates)
+                print(f"  ✅ [{title}] Deleted {len(to_delete)} duplicate properties:")
+                for name in to_delete:
+                    print(f"      - {name}")
+                total_deleted += len(to_delete)
+            except NotionAPIError as error:
+                print(f"  ❌ [{title}] Error: {error}")
+            
+            time.sleep(0.3)  # Rate limiting
+    
+    print(f"\nRepair complete: Deleted {total_deleted} duplicate properties")
+
+
 def command_dump(args: argparse.Namespace) -> int:
     source_client = NotionClient(api_key=args.src_key, timeout=args.timeout)
 
@@ -718,6 +843,21 @@ def command_upload(args: argparse.Namespace) -> int:
         return 1
 
 
+def command_repair(args: argparse.Namespace) -> int:
+    """Repair duplicate relation properties after upload."""
+    client = NotionClient(api_key=args.api_key, timeout=args.timeout)
+    try:
+        repair_duplicate_relations(
+            client=client,
+            parent_page_id=args.parent_page_id,
+            dump_dir=Path(args.dump_dir),
+        )
+        return 0
+    except (NotionAPIError, DumpFormatError, requests.RequestException) as error:
+        print(f"Error: {error}")
+        return 1
+
+
 def command_run(args: argparse.Namespace) -> int:
     source_client = NotionClient(api_key=args.src_key, timeout=args.timeout)
     destination_client = NotionClient(api_key=args.dst_key, timeout=args.timeout)
@@ -749,6 +889,16 @@ def command_run(args: argparse.Namespace) -> int:
             dump_dir=dump_dir,
             include_data=(args.copy_data == "yes"),
         )
+        
+        # Auto-repair duplicate relations after upload
+        if args.auto_repair == "yes":
+            print("\nAuto-repairing duplicate relations...")
+            repair_duplicate_relations(
+                client=destination_client,
+                parent_page_id=args.dst_parent_page_id,
+                dump_dir=dump_dir,
+            )
+        
         return 0
     except (NotionAPIError, DumpFormatError, requests.RequestException) as error:
         print(f"Error: {error}")
@@ -798,6 +948,16 @@ def parse_args() -> argparse.Namespace:
     upload_parser.add_argument("--dump-dir", required=True, help="Local dump directory (contains manifest.json).")
     upload_parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds.")
 
+    repair_parser = subparsers.add_parser("repair", help="Repair duplicate relation properties after upload.")
+    repair_parser.add_argument("--api-key", required=True, help="Notion API key for the workspace to repair.")
+    repair_parser.add_argument(
+        "--parent-page-id",
+        required=True,
+        help="Parent page ID containing the databases to repair.",
+    )
+    repair_parser.add_argument("--dump-dir", required=True, help="Local dump directory for reference.")
+    repair_parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds.")
+
     run_parser = subparsers.add_parser("run", help="Run dump then upload in one command (still uses local dump files).")
     run_parser.add_argument("--src-key", required=True, help="Notion API key for source workspace.")
     run_parser.add_argument("--dst-key", required=True, help="Notion API key for destination workspace.")
@@ -810,6 +970,12 @@ def parse_args() -> argparse.Namespace:
     )
     run_parser.add_argument("--dump-dir", required=True, help="Local dump directory to write/read.")
     run_parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout in seconds.")
+    run_parser.add_argument(
+        "--auto-repair",
+        choices=("yes", "no"),
+        default="yes",
+        help="Automatically repair duplicate relation properties after upload.",
+    )
 
     return parser.parse_args()
 
@@ -820,6 +986,8 @@ def main() -> int:
         return command_dump(args)
     if args.command == "upload":
         return command_upload(args)
+    if args.command == "repair":
+        return command_repair(args)
     if args.command == "run":
         return command_run(args)
     print(f"Unsupported command: {args.command}")
