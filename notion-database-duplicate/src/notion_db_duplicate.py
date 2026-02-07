@@ -26,7 +26,7 @@ import requests
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 MAX_RETRIES = 5
-DUMP_FORMAT_VERSION = 1
+DUMP_FORMAT_VERSION = 2  # Bumped for id_mapping support
 
 
 class NotionAPIError(RuntimeError):
@@ -297,11 +297,9 @@ def property_schema_config(
         if not source_relation_db_id:
             return None
         destination_relation_db_id = source_to_dest_db_map.get(source_relation_db_id, source_relation_db_id)
-        relation_type = relation.get("type", "single_property")
         relation_config: Dict[str, Any] = {"database_id": destination_relation_db_id}
         
         # Use single_property to avoid auto-generated reverse relations
-        # We'll create the reverse relation explicitly with the correct name
         relation_config["single_property"] = {}
         
         return prop_type, relation_config, "relation"
@@ -495,6 +493,29 @@ def ensure_dump_directory(dump_dir: Path) -> Tuple[Path, Path]:
     return dump_dir, databases_dir
 
 
+def extract_relation_properties(source_db: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract relation property info from a database schema for id_mapping."""
+    relations = []
+    source_db_id = source_db.get("id", "")
+    properties = source_db.get("properties", {})
+    
+    for prop_name, prop_val in properties.items():
+        if prop_val.get("type") != "relation":
+            continue
+        relation_info = prop_val.get("relation", {})
+        target_db_id = relation_info.get("database_id", "")
+        relation_type = relation_info.get("type", "single_property")
+        
+        relations.append({
+            "source_db_id": source_db_id,
+            "property_name": prop_name,
+            "target_db_id": target_db_id,
+            "relation_type": relation_type,
+        })
+    
+    return relations
+
+
 def dump_databases_to_files(
     source_client: NotionClient,
     source_database_ids: List[str],
@@ -503,6 +524,8 @@ def dump_databases_to_files(
 ) -> None:
     dump_dir, databases_dir = ensure_dump_directory(dump_dir)
     manifest_path = dump_dir / "manifest.json"
+    id_mapping_path = dump_dir / "id_mapping.json"
+    
     manifest: Dict[str, Any] = {
         "format_version": DUMP_FORMAT_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -510,11 +533,22 @@ def dump_databases_to_files(
         "include_data": include_data,
         "databases": [],
     }
+    
+    # Initialize id_mapping with relation properties
+    id_mapping: Dict[str, Any] = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "database_mappings": [],  # Will be filled during upload
+        "relation_properties": [],  # Filled during dump
+    }
 
     print(f"Writing dump to: {dump_dir}")
     for source_database_id in source_database_ids:
         print(f"  Dumping database schema: {source_database_id}")
         source_db = source_client.get_database(source_database_id)
+        
+        # Extract relation properties for id_mapping
+        relations = extract_relation_properties(source_db)
+        id_mapping["relation_properties"].extend(relations)
 
         pages: List[Dict[str, Any]] = []
         if include_data:
@@ -549,7 +583,11 @@ def dump_databases_to_files(
         )
 
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    id_mapping_path.write_text(json.dumps(id_mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    
     print(f"Dump manifest written: {manifest_path}")
+    print(f"ID mapping written: {id_mapping_path}")
+    print(f"  Relation properties captured: {len(id_mapping['relation_properties'])}")
 
 
 def load_dump(dump_dir: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -558,10 +596,11 @@ def load_dump(dump_dir: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         raise DumpFormatError(f"manifest.json not found in dump directory: {dump_dir}")
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("format_version") != DUMP_FORMAT_VERSION:
+    format_version = manifest.get("format_version", 1)
+    if format_version not in [1, 2]:
         raise DumpFormatError(
-            f"Unsupported dump format version: {manifest.get('format_version')}, "
-            f"expected {DUMP_FORMAT_VERSION}"
+            f"Unsupported dump format version: {format_version}, "
+            f"expected 1 or 2"
         )
 
     records: List[Dict[str, Any]] = []
@@ -577,6 +616,22 @@ def load_dump(dump_dir: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     return manifest, records
 
 
+def load_id_mapping(dump_dir: Path) -> Dict[str, Any]:
+    """Load id_mapping.json if it exists."""
+    id_mapping_path = dump_dir / "id_mapping.json"
+    if id_mapping_path.exists():
+        return json.loads(id_mapping_path.read_text(encoding="utf-8"))
+    return {"database_mappings": [], "relation_properties": []}
+
+
+def save_id_mapping(dump_dir: Path, id_mapping: Dict[str, Any]) -> None:
+    """Save id_mapping.json."""
+    id_mapping_path = dump_dir / "id_mapping.json"
+    id_mapping["updated_at"] = datetime.now(timezone.utc).isoformat()
+    id_mapping_path.write_text(json.dumps(id_mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"ID mapping updated: {id_mapping_path}")
+
+
 def upload_dump_to_destination(
     destination_client: NotionClient,
     destination_parent_page_id: str,
@@ -584,6 +639,7 @@ def upload_dump_to_destination(
     include_data: bool,
 ) -> None:
     manifest, records = load_dump(dump_dir)
+    id_mapping = load_id_mapping(dump_dir)
     warnings: List[str] = []
 
     source_to_destination_db_map: Dict[str, str] = {}
@@ -618,6 +674,13 @@ def upload_dump_to_destination(
         destination_db_id = destination_db.get("id")
         source_to_destination_db_map[source_database_id] = destination_db_id
         print(f"  {source_database_id} -> {destination_db_id}")
+
+    # Save database mappings to id_mapping
+    id_mapping["database_mappings"] = [
+        {"source_id": src_id, "dest_id": dst_id}
+        for src_id, dst_id in source_to_destination_db_map.items()
+    ]
+    save_id_mapping(dump_dir, id_mapping)
 
     print("Applying deferred complex schema properties...")
     for source_database_id in source_database_ids:
@@ -712,13 +775,119 @@ def repair_duplicate_relations(
     dump_dir: Path,
 ) -> None:
     """
-    Repair duplicate relation properties created by dual_property auto-generation.
+    Repair duplicate relation properties using id_mapping.json.
     
-    When Notion creates dual_property relations, it auto-generates reverse relations
-    with names like "Related to X (Y)". This function removes those duplicates
-    if the original property name already exists.
+    Uses explicit source→dest database ID mappings to precisely identify
+    which "Related to..." properties are auto-generated duplicates.
     """
-    print("Loading dump for reference...")
+    print("Loading id_mapping for precise repair...")
+    id_mapping = load_id_mapping(dump_dir)
+    
+    # Build source→dest database ID map
+    db_map: Dict[str, str] = {}
+    for mapping in id_mapping.get("database_mappings", []):
+        src_id = mapping.get("source_id", "")
+        dst_id = mapping.get("dest_id", "")
+        if src_id and dst_id:
+            # Normalize IDs (remove hyphens for comparison)
+            db_map[src_id.replace("-", "")] = dst_id.replace("-", "")
+            db_map[src_id] = dst_id
+    
+    if not db_map:
+        print("  No database mappings found. Falling back to title-based matching...")
+        return repair_duplicate_relations_by_title(client, parent_page_id, dump_dir)
+    
+    # Build set of original relation property names per source DB
+    original_relations: Dict[str, set] = {}  # source_db_id -> set of property names
+    for rel in id_mapping.get("relation_properties", []):
+        src_db_id = rel.get("source_db_id", "").replace("-", "")
+        prop_name = rel.get("property_name", "")
+        if src_db_id and prop_name:
+            if src_db_id not in original_relations:
+                original_relations[src_db_id] = set()
+            original_relations[src_db_id].add(prop_name)
+    
+    print(f"  Database mappings: {len(db_map) // 2}")
+    print(f"  Original relations tracked: {sum(len(v) for v in original_relations.values())}")
+    
+    # Get all databases under the parent page
+    print("Fetching destination databases...")
+    dest_dbs: List[Dict[str, Any]] = []
+    
+    for block in client.get_block_children(parent_page_id):
+        if block.get("type") == "child_database":
+            db_id = block["id"]
+            db_data = client.get_database(db_id)
+            dest_dbs.append({
+                "id": db_id,
+                "id_normalized": db_id.replace("-", ""),
+                "title": get_database_title_plain(db_data),
+                "properties": db_data.get("properties", {})
+            })
+    
+    print(f"  Found {len(dest_dbs)} destination databases")
+    
+    # Find source DB ID for each dest DB
+    dest_to_source: Dict[str, str] = {}
+    for src_id, dst_id in db_map.items():
+        if "-" not in src_id:  # Use normalized IDs
+            dest_to_source[dst_id] = src_id
+    
+    # Find and remove duplicate "Related to..." properties
+    print("\nRemoving duplicate 'Related to...' properties...")
+    total_deleted = 0
+    
+    for dest_db in dest_dbs:
+        dest_id_norm = dest_db["id_normalized"]
+        source_id = dest_to_source.get(dest_id_norm)
+        
+        if not source_id or source_id not in original_relations:
+            continue
+        
+        original_prop_names = original_relations[source_id]
+        dest_props = dest_db["properties"]
+        
+        # Find "Related to..." properties that are NOT in original
+        to_delete = []
+        for prop_name, prop_val in dest_props.items():
+            if prop_val.get("type") != "relation":
+                continue
+            
+            # If it's an original property, keep it
+            if prop_name in original_prop_names:
+                continue
+            
+            # If it starts with "Related to", it's likely auto-generated
+            if prop_name.startswith("Related to "):
+                to_delete.append(prop_name)
+        
+        if to_delete:
+            # Delete properties by setting them to None
+            updates = {name: None for name in to_delete}
+            try:
+                client.update_database(dest_db["id"], updates)
+                print(f"  ✅ [{dest_db['title']}] Deleted {len(to_delete)} duplicate properties:")
+                for name in to_delete:
+                    print(f"      - {name}")
+                total_deleted += len(to_delete)
+            except NotionAPIError as error:
+                print(f"  ❌ [{dest_db['title']}] Error: {error}")
+            
+            time.sleep(0.3)  # Rate limiting
+    
+    print(f"\nRepair complete: Deleted {total_deleted} duplicate properties")
+
+
+def repair_duplicate_relations_by_title(
+    client: NotionClient,
+    parent_page_id: str,
+    dump_dir: Path,
+) -> None:
+    """
+    Fallback: Repair duplicate relations using title-based matching.
+    Used when id_mapping.json is not available (format v1 dumps).
+    """
+    print("Using title-based matching (legacy mode)...")
     manifest, records = load_dump(dump_dir)
     
     # Build original property names per database title
@@ -732,7 +901,6 @@ def repair_duplicate_relations(
     print(f"  Loaded {len(original_props_by_title)} database schemas from dump")
     
     # Get all databases under the parent page
-    print("Fetching destination databases...")
     dest_dbs: Dict[str, Dict[str, Any]] = {}
     
     for block in client.get_block_children(parent_page_id):
@@ -748,7 +916,6 @@ def repair_duplicate_relations(
     print(f"  Found {len(dest_dbs)} destination databases")
     
     # Find and remove duplicate "Related to..." properties
-    print("\nRemoving duplicate 'Related to...' properties...")
     total_deleted = 0
     
     for title, dest_info in dest_dbs.items():
@@ -759,7 +926,6 @@ def repair_duplicate_relations(
         dest_props = dest_info["properties"]
         db_id = dest_info["id"]
         
-        # Find "Related to..." properties that are duplicates
         to_delete = []
         for prop_name, prop_val in dest_props.items():
             if not prop_name.startswith("Related to "):
@@ -767,10 +933,8 @@ def repair_duplicate_relations(
             if prop_val.get("type") != "relation":
                 continue
             
-            # Get target database ID
             target_id = prop_val.get("relation", {}).get("database_id", "")
             
-            # Check if any original property also points to this target
             for orig_name in original_names:
                 if orig_name not in dest_props:
                     continue
@@ -783,7 +947,6 @@ def repair_duplicate_relations(
                     break
         
         if to_delete:
-            # Delete properties by setting them to None
             updates = {name: None for name in to_delete}
             try:
                 client.update_database(db_id, updates)
@@ -794,7 +957,7 @@ def repair_duplicate_relations(
             except NotionAPIError as error:
                 print(f"  ❌ [{title}] Error: {error}")
             
-            time.sleep(0.3)  # Rate limiting
+            time.sleep(0.3)
     
     print(f"\nRepair complete: Deleted {total_deleted} duplicate properties")
 

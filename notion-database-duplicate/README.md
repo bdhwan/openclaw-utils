@@ -27,12 +27,16 @@ pip install -r requirements.txt
 ```
 dump-dir/
 ├── manifest.json
+├── id_mapping.json
 └── databases/
     ├── <source_database_id_1>.json
     └── <source_database_id_2>.json
 ```
 
-`manifest.json`에는 dump 메타정보와 파일 인덱스가 들어갑니다.
+- `manifest.json`: dump 메타정보와 파일 인덱스
+- `id_mapping.json`: 릴레이션 복구를 위한 ID 매핑 정보
+  - `database_mappings`: source_id → dest_id 매핑 (upload 후 기록됨)
+  - `relation_properties`: 원본 릴레이션 속성 정보 (dump 시 기록됨)
 
 ## Commands
 
