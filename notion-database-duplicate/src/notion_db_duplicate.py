@@ -695,11 +695,18 @@ def upload_dump_to_destination(
         )
         if not deferred_properties:
             continue
-        try:
-            destination_client.update_database(destination_db_id, deferred_properties)
-            print(f"  Updated complex properties for {destination_db_id}")
-        except NotionAPIError as error:
-            warnings.append(f"{source_database_id}: Could not apply all complex properties: {error}")
+        
+        # Apply each property individually to avoid one failure blocking others
+        success_count = 0
+        for prop_name, prop_value in deferred_properties.items():
+            try:
+                destination_client.update_database(destination_db_id, {prop_name: prop_value})
+                success_count += 1
+            except NotionAPIError as error:
+                warnings.append(f"{source_database_id}: Failed to apply '{prop_name}': {error}")
+        
+        if success_count > 0:
+            print(f"  Updated {success_count}/{len(deferred_properties)} complex properties for {destination_db_id}")
 
     dump_has_data = bool(manifest.get("include_data"))
     if include_data and not dump_has_data:
