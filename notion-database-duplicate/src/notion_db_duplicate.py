@@ -684,6 +684,8 @@ def upload_dump_to_destination(
         if source_title and source_title in existing_dbs_by_title:
             destination_db_id = existing_dbs_by_title[source_title]
             source_to_destination_db_map[source_database_id] = destination_db_id
+            # Mark as skipped (not newly created)
+            id_mapping.setdefault("skipped_databases", []).append(source_database_id)
             print(f"  ⏭️  {source_title} (already exists: {destination_db_id})")
             skipped_count += 1
             continue
@@ -718,31 +720,38 @@ def upload_dump_to_destination(
     ]
     save_id_mapping(dump_dir, id_mapping)
 
-    print("Applying deferred complex schema properties...")
-    for source_database_id in source_database_ids:
-        source_db = source_databases.get(source_database_id)
-        destination_db_id = source_to_destination_db_map.get(source_database_id)
-        if not source_db or not destination_db_id:
-            continue
-        _, deferred_properties, _ = build_database_properties(
-            source_properties=source_db.get("properties", {}),
-            source_to_dest_db_map=source_to_destination_db_map,
-            defer_complex=True,
-        )
-        if not deferred_properties:
-            continue
-        
-        # Apply each property individually to avoid one failure blocking others
-        success_count = 0
-        for prop_name, prop_value in deferred_properties.items():
-            try:
-                destination_client.update_database(destination_db_id, {prop_name: prop_value})
-                success_count += 1
-            except NotionAPIError as error:
-                warnings.append(f"{source_database_id}: Failed to apply '{prop_name}': {error}")
-        
-        if success_count > 0:
-            print(f"  Updated {success_count}/{len(deferred_properties)} complex properties for {destination_db_id}")
+    # Only apply deferred properties to newly created databases (not skipped ones)
+    skipped_db_ids = set(id_mapping.get("skipped_databases", []))
+    newly_created_ids = [db_id for db_id in source_database_ids if db_id not in skipped_db_ids]
+    
+    if newly_created_ids:
+        print(f"Applying deferred complex schema properties to {len(newly_created_ids)} new databases...")
+        for source_database_id in newly_created_ids:
+            source_db = source_databases.get(source_database_id)
+            destination_db_id = source_to_destination_db_map.get(source_database_id)
+            if not source_db or not destination_db_id:
+                continue
+            _, deferred_properties, _ = build_database_properties(
+                source_properties=source_db.get("properties", {}),
+                source_to_dest_db_map=source_to_destination_db_map,
+                defer_complex=True,
+            )
+            if not deferred_properties:
+                continue
+            
+            # Apply each property individually to avoid one failure blocking others
+            success_count = 0
+            for prop_name, prop_value in deferred_properties.items():
+                try:
+                    destination_client.update_database(destination_db_id, {prop_name: prop_value})
+                    success_count += 1
+                except NotionAPIError as error:
+                    warnings.append(f"{source_database_id}: Failed to apply '{prop_name}': {error}")
+            
+            if success_count > 0:
+                print(f"  Updated {success_count}/{len(deferred_properties)} complex properties for {destination_db_id}")
+    else:
+        print("No new databases to apply deferred properties to.")
 
     dump_has_data = bool(manifest.get("include_data"))
     if include_data and not dump_has_data:
