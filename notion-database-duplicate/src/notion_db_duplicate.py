@@ -325,6 +325,7 @@ def build_database_properties(
     source_properties: Dict[str, Dict[str, Any]],
     source_to_dest_db_map: Dict[str, str],
     defer_complex: bool,
+    all_db_properties: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], List[str]]:
     immediate_properties: Dict[str, Dict[str, Any]] = {}
     deferred_properties: Dict[str, Dict[str, Any]] = {}
@@ -337,6 +338,17 @@ def build_database_properties(
             continue
 
         prop_type, config, marker = result
+        
+        # Convert formula UUIDs to prop() syntax
+        if prop_type == "formula" and "expression" in config:
+            original_expr = config["expression"]
+            converted_expr = convert_formula_uuids_to_prop(
+                original_expr, 
+                source_properties,
+                all_db_properties
+            )
+            config["expression"] = converted_expr
+        
         payload = {prop_type: config}
         if defer_complex and marker in {"formula", "relation", "rollup"}:
             deferred_properties[property_name] = payload
@@ -538,6 +550,90 @@ def extract_rollup_properties(source_db: Dict[str, Any]) -> List[Dict[str, Any]]
     return rollups
 
 
+def convert_formula_uuids_to_prop(
+    expression: str, 
+    properties: Dict[str, Any],
+    all_db_properties: Optional[Dict[str, Dict[str, Any]]] = None
+) -> str:
+    """
+    Convert Notion's internal UUID formula syntax to prop() syntax.
+    
+    Input:  {{notion:block_property:Fnsa:00000000-...:00a7edf6-...}}
+    Output: prop("고객 DB")
+    
+    The format is: {{notion:block_property:PROP_ID:DB_ID:PAGE_ID}}
+    Where PROP_ID is the URL-decoded property ID.
+    
+    For nested references (related DB properties), DB_ID is the related database's ID.
+    """
+    import urllib.parse
+    
+    # Build property ID to name mapping for current DB
+    id_to_name: Dict[str, str] = {}
+    for prop_name, prop_val in properties.items():
+        prop_id = prop_val.get("id", "")
+        if prop_id:
+            decoded_id = urllib.parse.unquote(prop_id)
+            id_to_name[decoded_id] = prop_name
+            id_to_name[prop_id] = prop_name
+    
+    # Build mappings for all databases if provided
+    all_db_id_to_name: Dict[str, Dict[str, str]] = {}
+    if all_db_properties:
+        for db_id, db_props in all_db_properties.items():
+            db_map: Dict[str, str] = {}
+            for prop_name, prop_val in db_props.items():
+                prop_id = prop_val.get("id", "")
+                if prop_id:
+                    decoded_id = urllib.parse.unquote(prop_id)
+                    db_map[decoded_id] = prop_name
+                    db_map[prop_id] = prop_name
+            # Store with normalized DB ID
+            all_db_id_to_name[db_id.replace("-", "")] = db_map
+    
+    def replace_uuid(match: re.Match) -> str:
+        prop_id = match.group(1)
+        db_id = match.group(2).replace("-", "")
+        
+        # Check if it's a reference to current DB (zeros) or another DB
+        is_current_db = db_id == "00000000000000000000000000000000"
+        
+        if is_current_db:
+            # Look up in current DB properties
+            if prop_id in id_to_name:
+                prop_name = id_to_name[prop_id]
+                escaped_name = prop_name.replace('"', '\\"')
+                return f'prop("{escaped_name}")'
+            # Try URL-decoded version
+            decoded_prop_id = urllib.parse.unquote(prop_id)
+            if decoded_prop_id in id_to_name:
+                prop_name = id_to_name[decoded_prop_id]
+                escaped_name = prop_name.replace('"', '\\"')
+                return f'prop("{escaped_name}")'
+        else:
+            # Look up in related DB properties
+            if db_id in all_db_id_to_name:
+                db_map = all_db_id_to_name[db_id]
+                decoded_prop_id = urllib.parse.unquote(prop_id)
+                if prop_id in db_map:
+                    prop_name = db_map[prop_id]
+                    escaped_name = prop_name.replace('"', '\\"')
+                    return f'prop("{escaped_name}")'
+                if decoded_prop_id in db_map:
+                    prop_name = db_map[decoded_prop_id]
+                    escaped_name = prop_name.replace('"', '\\"')
+                    return f'prop("{escaped_name}")'
+        
+        # If we can't find the property, keep the original
+        return match.group(0)
+    
+    # Pattern: {{notion:block_property:PROP_ID:DB_ID:PAGE_ID}}
+    pattern = r'\{\{notion:block_property:([^:]+):([^:]+):[^}]+\}\}'
+    converted = re.sub(pattern, replace_uuid, expression)
+    
+    return converted
+
+
 def extract_formula_properties(source_db: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Extract formula property info from a database schema for id_mapping."""
     formulas = []
@@ -551,10 +647,14 @@ def extract_formula_properties(source_db: Dict[str, Any]) -> List[Dict[str, Any]
         expression = formula_info.get("expression", "")
         
         if expression:
+            # Convert UUID syntax to prop() syntax
+            converted_expression = convert_formula_uuids_to_prop(expression, properties)
+            
             formulas.append({
                 "source_db_id": source_db_id,
                 "property_name": prop_name,
-                "expression": expression,
+                "original_expression": expression,
+                "expression": converted_expression,
             })
     
     return formulas
@@ -708,6 +808,11 @@ def upload_dump_to_destination(
             continue
         source_databases[source_database_id] = source_db
 
+    # Build all DB properties mapping for formula conversion
+    all_db_properties: Dict[str, Dict[str, Any]] = {}
+    for db_id, db in source_databases.items():
+        all_db_properties[db_id] = db.get("properties", {})
+
     # Check for existing databases under the parent page
     print("Checking for existing databases...")
     existing_dbs_by_title: Dict[str, str] = {}  # title -> database_id
@@ -748,6 +853,7 @@ def upload_dump_to_destination(
             source_properties=source_db.get("properties", {}),
             source_to_dest_db_map=source_to_destination_db_map,
             defer_complex=True,
+            all_db_properties=all_db_properties,
         )
         warnings.extend([f"{source_database_id}: {warning}" for warning in property_warnings])
 
@@ -790,6 +896,7 @@ def upload_dump_to_destination(
                 source_properties=source_db.get("properties", {}),
                 source_to_dest_db_map=source_to_destination_db_map,
                 defer_complex=True,
+                all_db_properties=all_db_properties,
             )
             if not deferred_properties:
                 continue
@@ -825,6 +932,7 @@ def upload_dump_to_destination(
                 source_properties=source_db.get("properties", {}),
                 source_to_dest_db_map=source_to_destination_db_map,
                 defer_complex=True,
+                all_db_properties=all_db_properties,
             )
             if not deferred_properties:
                 continue
@@ -860,6 +968,7 @@ def upload_dump_to_destination(
                 source_properties=source_db.get("properties", {}),
                 source_to_dest_db_map=source_to_destination_db_map,
                 defer_complex=True,
+                all_db_properties=all_db_properties,
             )
             if not deferred_properties:
                 continue
